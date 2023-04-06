@@ -13,7 +13,7 @@
 # limitations under the License.
 import contextlib
 import logging
-from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, Generator, Iterator, List, Optional, OrderedDict, Tuple, Type, Union
 
 import torch
 from torch import Tensor
@@ -59,6 +59,7 @@ if _fsdp_available:
         MixedPrecision,
     )
     from torch.distributed.fsdp.wrap import enable_wrap
+    from torch.distributed.fsdp import StateDictType
 else:
     FullyShardedDataParallel = None  # type: ignore[misc,assignment]
     MixedPrecision = None  # type: ignore[misc,assignment]
@@ -69,21 +70,6 @@ if _distributed_available:
     from torch.distributed.distributed_c10d import _get_default_group
 
 log = logging.getLogger(__name__)
-
-
-class _FSDPStrategyModuleWrapper(_LightningModuleWrapperBase):
-    def state_dict(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
-        # this is required because with FSDP lightning_module is empty because weights are sharded.
-        # So we need to call self.trainer.model.state_dict (wrapped version) and use this wraper to
-        # avoid extra keys `_forward_module.layer.weight.` since we want `layer.weight.` in state_dict.
-        return self._forward_module.state_dict(*args, **kwargs)
-
-    def named_modules(self, *args: Any, **kwargs: Any) -> Iterator[Tuple[str, Module]]:
-        # This is required because FSDP explicitly checks that each flatted parameter in state_dict.
-        # Since we are wrapping the model, all flatted parameters will have `_forward_module.` prefix.
-        # This redirect avoids adding this prefix.
-        return self._forward_module.named_modules()
-
 
 class FSDPStrategy(ParallelStrategy):
     r"""Strategy for Fully Sharded Data Parallel provided by torch.distributed.
@@ -168,7 +154,16 @@ class FSDPStrategy(ParallelStrategy):
     def lightning_module_state_dict(self) -> Dict[str, Any]:
         """Returns model state."""
         assert self.model is not None
-        return self.model.state_dict()
+        if isinstance(self.model, FullyShardedDataParallel):
+            def remove_prefix(text: str, prefix: str):
+                if text.startswith(prefix):
+                    return text[len(prefix):]
+                return text
+            with FullyShardedDataParallel.state_dict_type(self.model, StateDictType.FULL_STATE_DICT):
+                state_dict = self.model.state_dict()
+            return OrderedDict({remove_prefix(k, "_forward_module."): v for k, v in state_dict.items()})
+        else:
+            return self.model.state_dict()
 
     @property
     def root_device(self) -> torch.device:
@@ -273,7 +268,7 @@ class FSDPStrategy(ParallelStrategy):
         self.lightning_module._device = self.root_device
 
         assert isinstance(self.model, pl.LightningModule)
-        self.model = _FSDPStrategyModuleWrapper(self.model)
+        self.model = _LightningModuleWrapperBase(self.model)
         if is_overridden("configure_sharded_model", self.lightning_module):
             rank_zero_info(
                 "You have overridden `LightningModule.configure_sharded_model` hook. It will assume that all the layers"
